@@ -29,19 +29,12 @@ static void fill_rect_buf(unsigned int *buf, int x, int y, int w, int h,
             put_pixel_buf(buf, x + i, y + j, rgb);
 }
 
-static void fb_restore_region(int x, int y, int w, int h) {
-    for (int j = 0; j < h; j++) {
-        int py = y + j;
-        if (py < 0 || py >= (int)g_H) continue;
-        for (int i = 0; i < w; i++) {
-            int px = x + i;
-            if (px < 0 || px >= (int)g_W) continue;
-            g_fb[py * g_pitch_px + px] = g_back[py * g_pitch_px + px];
-        }
-    }
-}
-
+/* g_back is the stdvga VRAM render target.  Keep this helper for the
+ * presentation path, but never bounce the same pixels through system RAM. */
 static void blit_back_to_fb(int x0, int y0, int x1, int y1) {
+    (void)x0; (void)y0; (void)x1; (void)y1;
+    if (g_back == g_fb) return;
+    /* Legacy fallback: only used if a backend exposes a separate shadow. */
     if (x0 < 0) x0 = 0;
     if (y0 < 0) y0 = 0;
     if (x1 > (int)g_W) x1 = (int)g_W;
@@ -400,15 +393,27 @@ static const unsigned short cursor_bits[CUR_H] = {
 
 static int mouse_x = 0, mouse_y = 0;
 static int mouse_prev_x = -1, mouse_prev_y = -1;
+static unsigned int mouse_save[CUR_W * CUR_H];
 
 static int mouse_intersects_rect(int x0, int y0, int x1, int y1) {
     return x1 > mouse_x && x0 < mouse_x + CUR_W &&
            y1 > mouse_y && y0 < mouse_y + CUR_H;
 }
 
+/* The stdvga front buffer doubles as the render target, so the cursor
+ * must save/restore the VRAM pixels directly instead of relying on a
+ * separate system-RAM composition buffer. */
 static void mouse_restore(void) {
     if (mouse_prev_x < 0) return;
-    fb_restore_region(mouse_prev_x, mouse_prev_y, CUR_W, CUR_H);
+    for (int j = 0; j < CUR_H; j++) {
+        int py = mouse_prev_y + j;
+        if (py < 0 || py >= (int)g_H) continue;
+        for (int i = 0; i < CUR_W; i++) {
+            int px = mouse_prev_x + i;
+            if (px < 0 || px >= (int)g_W) continue;
+            g_fb[py * g_pitch_px + px] = mouse_save[j * CUR_W + i];
+        }
+    }
     mouse_prev_x = -1;
     mouse_prev_y = -1;
 }
@@ -419,10 +424,11 @@ static void mouse_draw(void) {
         int py = mouse_y + j;
         if (py < 0 || py >= (int)g_H) continue;
         for (int i = 0; i < CUR_W; i++) {
-            if (!(row & (0x8000 >> i))) continue;
             int px = mouse_x + i;
             if (px < 0 || px >= (int)g_W) continue;
-            g_fb[py * g_pitch_px + px] = 0xFFFFFF;
+            int off = py * g_pitch_px + px;
+            mouse_save[j * CUR_W + i] = g_fb[off];
+            if (row & (0x8000 >> i)) g_fb[off] = 0xFFFFFF;
         }
     }
     mouse_prev_x = mouse_x;
@@ -1159,13 +1165,10 @@ int main(int argc, char **argv) {
     g_H  = info.height;
     g_pitch_px = info.pitch / 4;
 
-    unsigned int back_size = info.pitch * info.height;
-    unsigned int back_addr = mmap(0, back_size,
-                                  PROT_READ | PROT_WRITE,
-                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if ((int)back_addr <= 0) { printf("wm: back mmap failed\n"); return 1; }
-    g_back = (unsigned int*)back_addr;
-    memset(g_back, 0, back_size);
+    /* Render directly into the stdvga VRAM mapping.  The display engine
+     * scans this buffer out; there is no system-RAM back buffer or final
+     * framebuffer copy. */
+    g_back = g_fb;
     fill_rect_buf(g_back, 0, 0, g_W, g_H, COL_BG);
 
     wm_font_load();
